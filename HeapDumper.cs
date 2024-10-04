@@ -2,6 +2,8 @@ using System.Reflection;
 using System.Runtime;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.ExceptionServices;
+using System.Security;
 
 namespace HeapDumper;
 
@@ -11,6 +13,8 @@ public static class HeapDumper
 {
     public static void Main() { }
 
+    [HandleProcessCorruptedStateExceptions]
+    [SecurityCritical]
     public static unsafe List<HeapInfo> DumpHeap()
     {
         if (!GCSettings.IsServerGC)
@@ -25,31 +29,40 @@ public static class HeapDumper
         // Preallocate the dictionary with a large size, to reduce the number of potential allocations in the no-gc region
         var stats = new Dictionary<nint, (ulong count, ulong totalSize)>(1000);
 
-        // Force a GC to minimize the amount of memory dangling in the allocation contexts
-        GC.Collect(2, GCCollectionMode.Forced, true, true);
+        try
+        {
+            // Force a GC to minimize the amount of memory dangling in the allocation contexts
+            GC.Collect(2, GCCollectionMode.Forced, true, true);
 
-        GC.TryStartNoGCRegion(200 * 1024 * 1024);
-        GC.RegisterNoGCRegionCallback(150 * 1024 * 1024, () => throw new OutOfMemoryException("Interrupted by GC."));
+            GC.TryStartNoGCRegion(200 * 1024 * 1024);
+            GC.RegisterNoGCRegionCallback(150 * 1024 * 1024, () => throw new OutOfMemoryException("Interrupted by GC."));
 
-        ref var thread = ref NativeThread.GetCurrentNativeThread();
-        var heap = thread.m_alloc_context.gc_reserved_1;
+            ref var thread = ref NativeThread.GetCurrentNativeThread();
+            var heap = thread.m_alloc_context.gc_reserved_1;
 
-        var vtablePtr = (nint*)heap->vtable;
+            var vtablePtr = (nint*)heap->vtable;
 
-        var diagDescrGenerationsAddr = *(vtablePtr + 69);
-        var diagDescrGenerations = (delegate* unmanaged<GCHeap*, delegate* unmanaged<void*, int, IntPtr, IntPtr, IntPtr, void>, void*, void>)diagDescrGenerationsAddr;
+            var diagDescrGenerationsAddr = *(vtablePtr + 69);
+            var diagDescrGenerations = (delegate* unmanaged<GCHeap*, delegate* unmanaged<void*, int, IntPtr, IntPtr, IntPtr, void>, void*, void>)diagDescrGenerationsAddr;
 
-        var walkGeneration = (delegate* unmanaged<void*, int, IntPtr, IntPtr, IntPtr, void>)&WalkGeneration;
+            var walkGeneration = (delegate* unmanaged<void*, int, IntPtr, IntPtr, IntPtr, void>)&WalkGeneration;
 
-        var context = ValueTuple.Create(stats);
+            var context = ValueTuple.Create(stats);
 
-        diagDescrGenerations(thread.m_alloc_context.gc_reserved_1, walkGeneration, &context);
+            diagDescrGenerations(thread.m_alloc_context.gc_reserved_1, walkGeneration, &context);
 
-        WalkNGCH(&context);
+            WalkNGCH(&context);
 
-        GC.EndNoGCRegion();
+            GC.EndNoGCRegion();
 
-        return ParseStats(stats);
+            return ParseStats(stats);
+        }
+        catch (Exception ex) // If an exception is ever caught here, it's guaranteed to be pretty bad.
+        {
+            Console.WriteLine($"Fatal error dumping heap: {ex}");
+            Environment.Exit(1);
+            throw;
+        }
     }
 
     private static unsafe List<HeapInfo> ParseStats(Dictionary<nint, (ulong count, ulong totalSize)> stats)
